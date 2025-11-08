@@ -1,0 +1,37 @@
+# Open .gitignore in VSCode and add:
+```
+```
+# Data files
+*.csv
+*.parquet
+*.json
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# VSCode
+.vscode/
+
+# Model files (these can be large)
+*.pkl
+*.h5
+*.pt
+models/*.pkl
+
+# Environment variables
+venv/
+.venv/
+.env
+# OS
+.DS_Store
