@@ -5,6 +5,7 @@ Uses XGBoost for optimal play type recommendation
 """
 
 import argparse
+from email import parser
 import pickle
 import os
 from pathlib import Path
@@ -38,6 +39,9 @@ def parse_args():
 
     # Model selection
     parser.add_argument('--model', type=str, default='all',choices=['conversion', 'fg', 'all'], help='Which model to train')
+    parser.add_argument('--experiment-mode', action='store_true', help='Run multiple train/test splits and aggregate results')
+    parser.add_argument('--n-runs', type=int, default=10, help='Number of runs for experiment mode')
+    parser.add_argument('--save-results', type=str, default=None, help='Save aggregated results to JSON file')
 
     # Train/test split
     parser.add_argument('--test-seasons', nargs='+', type=int,default=[2023, 2024], help='Seasons to use for testing')
@@ -58,6 +62,8 @@ def parse_args():
     # Other options
     parser.add_argument('--random-state', type=int, default=42, help='Random seed for reproducibility (default: 42)')
     parser.add_argument('--verbose', action='store_true', help='Print detailed progress information')
+    parser.add_argument('--quiet', action='store_true', help='Reduce output verbosity')  # ADD THIS LINE
+
     
     return parser.parse_args()
 
@@ -282,7 +288,7 @@ class ConversionModelXGB:
     ############################
     # Save Model
     ############################
-    def save_model(self, filepath='models/stage2_conversion_xgb.pkl'):
+    def save(self, filepath='models/stage2_conversion_xgb.pkl'):
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, 'wb') as f:
             pickle.dump(self, f)    
@@ -332,14 +338,14 @@ class FieldGoalModelXGB:
         print("PREPARING FIELD GOAL MODEL DATA (XGBoost)")
         print("="*70)
 
-        fg_attempts = df[df['attempted_field_goal'] == 1].copy()
+        fg_attempts = df[df['is_field_goal'] == 1].copy()
 
         print(f"\nTotal 4th downs: {len(df):,}")
         print(f"FG attempts: {len(fg_attempts):,} ({len(fg_attempts)/len(df)*100:.1f}%)")
 
         #caluclate fg distance if needed
         if 'fg_distance' not in fg_attempts.columns:
-            fg_attempts['fg_distance'] = fg_attempts['field_poition'] + 17
+            fg_attempts['fg_distance'] = fg_attempts['field_position'] + 17
 
         self.features = [
             'fg_distance',
@@ -492,6 +498,107 @@ def split_by_season(df, X, y, test_seasons):
     return X_train, X_test, y_train, y_test
 
 
+
+
+def random_season_split(all_seasons, test_size=0.15, random_state=None):
+    """Randomly select test seasons"""
+    import random
+    if random_state is not None:
+        random.seed(random_state)
+    
+    n_test = max(1, int(len(all_seasons) * test_size))
+    test_seasons = random.sample(list(all_seasons), n_test)
+    return test_seasons
+
+
+def aggregate_metrics(all_results):
+    """Aggregate metrics across multiple runs"""
+    metrics = ['accuracy', 'auc']
+    aggregated = {}
+    
+    for metric in metrics:
+        values = [r[metric] for r in all_results]
+        aggregated[metric] = {
+            'mean': np.mean(values),
+            'std': np.std(values),
+            'min': np.min(values),
+            'max': np.max(values),
+            'all_values': values
+        }
+    
+    return aggregated
+
+
+def run_experiments(args, df, model_type='conversion'):
+    """Run multiple experiments with different season splits"""
+    print("\n" + "="*70)
+    print(f"EXPERIMENT MODE: {args.n_runs} runs")
+    print("="*70)
+    
+    # Get all seasons
+    all_seasons = sorted(df['season'].unique())
+    
+    all_results = []
+    
+    for run_idx in range(args.n_runs):
+        print(f"\nRun {run_idx + 1}/{args.n_runs}")
+        print("-"*50)
+        
+        # Random season split
+        test_seasons = random_season_split(all_seasons, test_size=0.15, random_state=42 + run_idx)
+        print(f"Test seasons: {sorted(test_seasons)}")
+        
+        # Prepare model
+        if model_type == 'conversion':
+            model = ConversionModelXGB(args)
+            X, y, clean_data = model.prepare_data(df)
+        else:
+            model = FieldGoalModelXGB(args)
+            X, y, clean_data = model.prepare_data(df)
+        
+        # Split and train
+        X_train, X_test, y_train, y_test = split_by_season(clean_data, X, y, test_seasons=test_seasons)
+        model.train(X_train, y_train)
+        results = model.evaluate(X_test, y_test)
+        
+        all_results.append(results)
+    
+    # Aggregate
+    aggregated = aggregate_metrics(all_results)
+    
+    print("\n" + "="*70)
+    print("AGGREGATED RESULTS")
+    print("="*70)
+    for metric, stats in aggregated.items():
+        print(f"\n{metric.upper()}:")
+        print(f"  Mean: {stats['mean']:.4f}")
+        print(f"  Std:  {stats['std']:.4f}")
+        print(f"  Min:  {stats['min']:.4f}")
+        print(f"  Max:  {stats['max']:.4f}")
+    
+    # Save if requested
+    if args.save_results:
+        import json
+        output = {
+            'model': model_type,
+            'n_runs': args.n_runs,
+            'hyperparameters': {
+                'max_depth': args.max_depth,
+                'learning_rate': args.learning_rate,
+                'n_estimators': args.n_estimators
+            },
+            'aggregated': aggregated,
+            'individual_runs': all_results
+        }
+        
+        with open(args.save_results, 'w') as f:
+            json.dump(output, f, indent=2)
+        print(f"\n✓ Results saved to {args.save_results}")
+    
+    return aggregated
+
+
+
 ############################################
 # Main Execution
 ############################################
@@ -502,6 +609,26 @@ def main():
     print("STAGE 2: OUTCOME PREDICTION (XGBoost)")
     print("="*70)
     
+    # Load data
+    df = load_data(args.data_path)
+    
+    # EXPERIMENT MODE
+    if args.experiment_mode:
+        if args.model in ['conversion', 'all']:
+            print("\n" + "="*70)
+            print("CONVERSION MODEL - EXPERIMENT MODE")
+            print("="*70)
+            conv_results = run_experiments(args, df, model_type='conversion')
+        
+        if args.model in ['fg', 'all']:
+            print("\n" + "="*70)
+            print("FIELD GOAL MODEL - EXPERIMENT MODE")
+            print("="*70)
+            fg_results = run_experiments(args, df, model_type='fg')
+        
+        return  # Exit after experiments
+    
+    # NORMAL MODE (original code)
     if not args.quiet:
         print(f"\nConfiguration:")
         print(f"  Max depth: {args.max_depth}")
@@ -509,6 +636,58 @@ def main():
         print(f"  N estimators: {args.n_estimators}")
         print(f"  Test seasons: {args.test_seasons}")
         print(f"  Training: {args.model}")
+    
+    results = {}
+    
+    # Train Conversion Model
+    if args.model in ['conversion', 'all']:
+        print("\n" + "="*70)
+        print("MODEL 1: CONVERSION PROBABILITY (XGBoost)")
+        print("="*70)
+        
+        conv_model = ConversionModelXGB(args)
+        X, y, clean_data = conv_model.prepare_data(df)
+        X_train, X_test, y_train, y_test = split_by_season(
+            clean_data, X, y, test_seasons=args.test_seasons
+        )
+        
+        conv_model.train(X_train, y_train)
+        results['conversion'] = conv_model.evaluate(X_test, y_test)
+        conv_model.save(os.path.join(args.output_dir, 'stage2_conversion_xgb.pkl'))
+    
+    # Train FG Model
+    if args.model in ['fg', 'all']:
+        print("\n" + "="*70)
+        print("MODEL 2: FIELD GOAL SUCCESS (XGBoost)")
+        print("="*70)
+        
+        fg_model = FieldGoalModelXGB(args)
+        X, y, clean_data = fg_model.prepare_data(df)
+        X_train, X_test, y_train, y_test = split_by_season(
+            clean_data, X, y, test_seasons=args.test_seasons
+        )
+        
+        fg_model.train(X_train, y_train)
+        results['fg'] = fg_model.evaluate(X_test, y_test)
+        fg_model.save(os.path.join(args.output_dir, 'stage2_fg_xgb.pkl'))
+    
+    # Summary
+    print("\n" + "="*70)
+    print("STAGE 2 COMPLETE")
+    print("="*70)
+    
+    if 'conversion' in results:
+        print(f"\nConversion Model (XGBoost):")
+        print(f"  Accuracy: {results['conversion']['accuracy']:.3f}")
+        print(f"  AUC: {results['conversion']['auc']:.3f}")
+    
+    if 'fg' in results:
+        print(f"\nField Goal Model (XGBoost):")
+        print(f"  Accuracy: {results['fg']['accuracy']:.3f}")
+        print(f"  AUC: {results['fg']['auc']:.3f}")
+    
+    print("\nNext step: Build Decision Engine")
+
 
 if __name__ == "__main__":
     main()
